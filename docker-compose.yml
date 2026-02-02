@@ -1,0 +1,40 @@
+services:
+  cookbook:
+    build: .
+    container_name: 'recipe-tracker'
+    restart: 'unless-stopped'
+    
+    # Connect to the existing network from your main stack
+    networks:
+      - net
+
+    volumes:
+      # Format: Host Path : Container Path
+      # ${HOME} resolves to your user's home directory on the host machine
+      - ${HOME}/.recipe-tracker:/root/.recipe-tracker
+      
+    labels:
+      traefik.enable: 'true'
+      
+      ## Router Config
+      traefik.http.routers.cookbook.rule: 'Host(`cookbook.jackx.dev`)'
+      traefik.http.routers.cookbook.entrypoints: 'https'
+      traefik.http.routers.cookbook.tls: 'true'
+      traefik.http.routers.cookbook.tls.certresolver: 'letsencrypt'
+      
+      ## 🔒 Authelia Integration
+      # "authelia@docker" works across different compose files automatically
+      # as long as Traefik can see this container via the Docker socket.
+      traefik.http.routers.cookbook.middlewares: 'authelia@docker'
+      
+      ## Service Port
+      # Update this if your Go app listens on a different port
+      traefik.http.services.cookbook.loadbalancer.server.port: '9005'
+
+# Define the network as external
+networks:
+  net:
+    external: true
+    # If Docker complains it can't find "net", check your main stack's 
+    # actual network name using `docker network ls`. 
+    # It might be named "main_folder_net" if the name wasn't explicitly set globally.
