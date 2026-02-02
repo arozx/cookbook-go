@@ -1,0 +1,41 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:  # Manual trigger
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Build binary
+        run: |
+          ./build.sh linux-arm64
+
+      - name: Setup Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+       - name: Deploy to VPS
+         run: |
+               # Copy binary to VPS
+               scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                 dist/recipe-tracker-server-linux-arm64 ${{ secrets.VPS_USER }}@${{ secrets.VPS_TAILSCALE_IP }}:/home/${{ secrets.VPS_USER }}/recipe-tracker
+       
+               # Restart service
+               ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                 ${{ secrets.VPS_USER }}@${{ secrets.VPS_TAILSCALE_IP }} \
+                 "sudo systemctl restart recipe-tracker"

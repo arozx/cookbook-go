@@ -10,9 +10,22 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/cookbook-go/recipe-tracker/internal/images"
 	"github.com/cookbook-go/recipe-tracker/internal/models"
-	"github.com/cookbook-go/recipe-tracker/internal/parser"
-	"github.com/cookbook-go/recipe-tracker/internal/storage"
 )
+
+// SyncNotifier interface for notifying about recipe changes
+type SyncNotifier interface {
+	NotifyChange(eventType string, recipe *models.Recipe, recipeID string)
+}
+
+// RecipeFetcher interface for parsing recipes from URLs
+type RecipeFetcher interface {
+	FetchAndParse(url string) (*models.Recipe, error)
+}
+
+// RemoteRecipeFetcher interface for remote parsing (via API)
+type RemoteRecipeFetcher interface {
+	ParseRecipeURL(url string) (*models.Recipe, error)
+}
 
 // View represents different screens in the app
 type View int
@@ -27,10 +40,18 @@ const (
 
 // Model represents the application state
 type Model struct {
-	// Core dependencies
-	store      *storage.Store
-	parser     *parser.Parser
-	downloader *images.Downloader
+	// Core dependencies - use interface for flexibility
+	store       models.RecipeRepository
+	fetcher     RecipeFetcher       // Local parser
+	remoteFetch RemoteRecipeFetcher // Remote parser (when connected to server)
+	downloader  *images.Downloader
+	isRemote    bool // true if connected to remote server
+
+	// API server for sync notifications (server mode only)
+	apiServer SyncNotifier
+
+	// Remote client for sync to external server
+	remoteClient models.RecipeRepository
 
 	// UI state
 	view         View
@@ -38,6 +59,9 @@ type Model struct {
 	width        int
 	height       int
 	ready        bool
+
+	// Remote connection info
+	serverURL string
 
 	// Recipe list
 	recipes       []models.Recipe
@@ -54,7 +78,8 @@ type Model struct {
 	viewport      viewport.Model
 	recipeImage   string
 	showImage     bool
-	imageTab      int // 0: ingredients, 1: instructions, 2: image
+	imageTab      int  // 0: ingredients, 1: instructions, 2: image
+	useGraphics   bool // true if using Kitty/iTerm2/Sixel (non-text graphics)
 
 	// Loading state
 	spinner    spinner.Model
@@ -82,8 +107,31 @@ type recipesRefreshedMsg struct {
 	recipes []models.Recipe
 }
 
-// NewModel creates a new application model
-func NewModel(store *storage.Store, parser *parser.Parser, downloader *images.Downloader) Model {
+// remoteEventMsg is sent when a remote event is received
+type remoteEventMsg struct {
+	eventType string
+	recipe    *models.Recipe
+	recipeID  string
+}
+
+// RemoteEventMsg is the exported version for use by main.go
+type RemoteEventMsg struct {
+	EventType string
+	Recipe    *models.Recipe
+	RecipeID  string
+}
+
+// NewModel creates a new application model with local storage
+func NewModel(store models.RecipeRepository, fetcher RecipeFetcher, downloader *images.Downloader) Model {
+	return newModelInternal(store, fetcher, nil, downloader, false, "")
+}
+
+// NewRemoteModel creates a new application model connected to a remote server
+func NewRemoteModel(store models.RecipeRepository, remoteFetcher RemoteRecipeFetcher, downloader *images.Downloader, serverURL string) Model {
+	return newModelInternal(store, nil, remoteFetcher, downloader, true, serverURL)
+}
+
+func newModelInternal(store models.RecipeRepository, fetcher RecipeFetcher, remoteFetch RemoteRecipeFetcher, downloader *images.Downloader, isRemote bool, serverURL string) Model {
 	// URL input
 	ti := textinput.New()
 	ti.Placeholder = "https://example.com/recipe"
@@ -107,10 +155,22 @@ func NewModel(store *storage.Store, parser *parser.Parser, downloader *images.Do
 
 	allRecipes := store.GetAllRecipes()
 
+	// Check if we're using a graphics protocol (non-text based)
+	var useGraphics bool
+	if downloader != nil {
+		protocol := downloader.GetProtocol()
+		useGraphics = protocol == images.ProtocolKitty ||
+			protocol == images.ProtocolITerm2 ||
+			protocol == images.ProtocolSixel
+	}
+
 	return Model{
 		store:       store,
-		parser:      parser,
+		fetcher:     fetcher,
+		remoteFetch: remoteFetch,
 		downloader:  downloader,
+		isRemote:    isRemote,
+		serverURL:   serverURL,
 		view:        ViewList,
 		recipes:     allRecipes,
 		allRecipes:  allRecipes,
@@ -118,7 +178,18 @@ func NewModel(store *storage.Store, parser *parser.Parser, downloader *images.Do
 		searchInput: si,
 		spinner:     sp,
 		viewport:    vp,
+		useGraphics: useGraphics,
 	}
+}
+
+// SetAPIServer sets the API server for sync notifications
+func (m *Model) SetAPIServer(server SyncNotifier) {
+	m.apiServer = server
+}
+
+// SetRemoteClient sets the remote client for sync
+func (m *Model) SetRemoteClient(client models.RecipeRepository) {
+	m.remoteClient = client
 }
 
 // Init initializes the model
@@ -144,6 +215,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.Height = msg.Height - 10
 		m.ready = true
 
+		// Reload image if we're viewing a recipe with an image
+		// Reload image if viewing recipe with photo tab or if using half-block (which is in viewport)
+		if m.view == ViewRecipe && m.currentRecipe != nil && len(m.currentRecipe.ImagePaths) > 0 {
+			// Only reload if on photo tab (graphics mode) or any tab (half-block needs resize too)
+			if m.imageTab == 2 || !m.useGraphics {
+				m.recipeImage = "" // Clear cached image to reload at new size
+				return m, m.loadImage(m.currentRecipe.ImagePaths[0])
+			}
+		}
+
 	case recipeLoadedMsg:
 		if msg.err != nil {
 			m.addError = fmt.Sprintf("Error: %v", msg.err)
@@ -151,8 +232,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		// Download images
-		if len(msg.recipe.ImageURLs) > 0 {
+		// Download images (only if we have a downloader)
+		if m.downloader != nil && len(msg.recipe.ImageURLs) > 0 {
 			msg.recipe.ImagePaths = m.downloader.DownloadAll(msg.recipe.ImageURLs)
 		}
 
@@ -161,6 +242,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.addError = fmt.Sprintf("Error saving: %v", err)
 			m.view = ViewAdd
 			return m, nil
+		}
+
+		// Notify remote client for sync
+		if m.remoteClient != nil {
+			go func() {
+				_ = m.remoteClient.AddRecipe(*msg.recipe)
+			}()
 		}
 
 		m.recipes = m.store.GetAllRecipes()
@@ -173,7 +261,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.imageTab = 0
 
 		// Load image for display
-		if len(msg.recipe.ImagePaths) > 0 {
+		if m.downloader != nil && len(msg.recipe.ImagePaths) > 0 {
 			return m, m.loadImage(msg.recipe.ImagePaths[0])
 		}
 		return m, nil
@@ -186,6 +274,45 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case recipesRefreshedMsg:
 		m.recipes = msg.recipes
+		m.allRecipes = msg.recipes
+		return m, nil
+
+	case remoteEventMsg:
+		// Handle real-time sync events from remote server
+		switch msg.eventType {
+		case "add", "update":
+			if msg.recipe != nil {
+				m.recipes = m.store.GetAllRecipes()
+				m.allRecipes = m.recipes
+			}
+		case "delete":
+			m.recipes = m.store.GetAllRecipes()
+			m.allRecipes = m.recipes
+			// If we're viewing the deleted recipe, go back to list
+			if m.currentRecipe != nil && m.currentRecipe.ID == msg.recipeID {
+				m.view = ViewList
+				m.currentRecipe = nil
+			}
+		}
+		return m, nil
+
+	case RemoteEventMsg:
+		// Handle exported remote event message (from main.go)
+		switch msg.EventType {
+		case "add", "update":
+			if msg.Recipe != nil {
+				m.recipes = m.store.GetAllRecipes()
+				m.allRecipes = m.recipes
+			}
+		case "delete":
+			m.recipes = m.store.GetAllRecipes()
+			m.allRecipes = m.recipes
+			// If we're viewing the deleted recipe, go back to list
+			if m.currentRecipe != nil && m.currentRecipe.ID == msg.RecipeID {
+				m.view = ViewList
+				m.currentRecipe = nil
+			}
+		}
 		return m, nil
 
 	case spinner.TickMsg:
@@ -224,18 +351,28 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 		// Go back to list from other views
+		// Clear screen if leaving photo tab with graphics
+		needsClear := m.view == ViewRecipe && m.imageTab == 2 && m.useGraphics
 		m.view = ViewList
 		m.addError = ""
 		m.addSuccess = ""
 		m.recipeImage = ""
+		if needsClear {
+			return m, tea.ClearScreen
+		}
 		return m, nil
 
 	case "esc":
 		if m.view != ViewList {
+			// Clear screen if leaving photo tab with graphics
+			needsClear := m.view == ViewRecipe && m.imageTab == 2 && m.useGraphics
 			m.view = ViewList
 			m.addError = ""
 			m.addSuccess = ""
 			m.recipeImage = ""
+			if needsClear {
+				return m, tea.ClearScreen
+			}
 			return m, nil
 		}
 	}
@@ -310,6 +447,14 @@ func (m Model) handleListKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(m.recipes) > 0 && m.selectedIndex < len(m.recipes) {
 			recipe := m.recipes[m.selectedIndex]
 			m.store.DeleteRecipe(recipe.ID)
+
+			// Notify remote client for sync
+			if m.remoteClient != nil {
+				go func() {
+					_ = m.remoteClient.DeleteRecipe(recipe.ID)
+				}()
+			}
+
 			m.recipes = m.store.GetAllRecipes()
 			m.allRecipes = m.recipes
 			if m.selectedIndex >= len(m.recipes) && m.selectedIndex > 0 {
@@ -359,29 +504,64 @@ func (m Model) handleAddKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m Model) handleRecipeKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "tab":
+		oldTab := m.imageTab
 		m.imageTab = (m.imageTab + 1) % 3
 		m.viewport.SetContent(m.renderRecipeContent())
 		m.viewport.GotoTop()
+		// Clear graphics and reload if switching to/from photo tab with graphics mode
+		if m.useGraphics && oldTab == 2 {
+			// Switching away from photo - clear graphics and redraw
+			m.recipeImage = ""
+			return m, tea.ClearScreen
+		}
+		if m.useGraphics && m.imageTab == 2 && len(m.currentRecipe.ImagePaths) > 0 {
+			m.recipeImage = ""
+			return m, m.loadImage(m.currentRecipe.ImagePaths[0])
+		}
 
 	case "shift+tab":
+		oldTab := m.imageTab
 		m.imageTab = (m.imageTab + 2) % 3
 		m.viewport.SetContent(m.renderRecipeContent())
 		m.viewport.GotoTop()
+		if m.useGraphics && oldTab == 2 {
+			m.recipeImage = ""
+			return m, tea.ClearScreen
+		}
+		if m.useGraphics && m.imageTab == 2 && len(m.currentRecipe.ImagePaths) > 0 {
+			m.recipeImage = ""
+			return m, m.loadImage(m.currentRecipe.ImagePaths[0])
+		}
 
 	case "i":
+		wasOnPhoto := m.imageTab == 2
 		m.imageTab = 0
 		m.viewport.SetContent(m.renderRecipeContent())
 		m.viewport.GotoTop()
+		if wasOnPhoto && m.useGraphics {
+			m.recipeImage = ""
+			return m, tea.ClearScreen
+		}
 
 	case "s":
+		wasOnPhoto := m.imageTab == 2
 		m.imageTab = 1
 		m.viewport.SetContent(m.renderRecipeContent())
 		m.viewport.GotoTop()
+		if wasOnPhoto && m.useGraphics {
+			m.recipeImage = ""
+			return m, tea.ClearScreen
+		}
 
 	case "p":
 		m.imageTab = 2
 		m.viewport.SetContent(m.renderRecipeContent())
 		m.viewport.GotoTop()
+		// Reload image with fullscreen dimensions for graphics mode
+		if m.useGraphics && len(m.currentRecipe.ImagePaths) > 0 {
+			m.recipeImage = ""
+			return m, m.loadImage(m.currentRecipe.ImagePaths[0])
+		}
 	}
 
 	// Viewport navigation
@@ -422,18 +602,78 @@ func (m Model) handleSearchKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 // fetchRecipe fetches a recipe from URL
 func (m Model) fetchRecipe(url string) tea.Cmd {
+	// Use remote fetcher if connected to server, otherwise local
+	if m.isRemote && m.remoteFetch != nil {
+		return func() tea.Msg {
+			recipe, err := m.remoteFetch.ParseRecipeURL(url)
+			return recipeLoadedMsg{recipe: recipe, err: err}
+		}
+	}
+
+	if m.fetcher != nil {
+		return func() tea.Msg {
+			recipe, err := m.fetcher.FetchAndParse(url)
+			return recipeLoadedMsg{recipe: recipe, err: err}
+		}
+	}
+
 	return func() tea.Msg {
-		recipe, err := m.parser.FetchAndParse(url)
-		return recipeLoadedMsg{recipe: recipe, err: err}
+		return recipeLoadedMsg{recipe: nil, err: fmt.Errorf("no recipe fetcher available")}
 	}
 }
 
 // loadImage loads an image for display
 func (m Model) loadImage(path string) tea.Cmd {
+	// Calculate dimensions based on terminal size and current tab
+	// For graphics protocols on photo tab, use more of the screen
+	// For half-block or non-photo tabs, fit within viewport
+
+	var width, height int
+
+	// Use fullscreen dimensions for graphics mode on photo tab
+	useFullscreen := m.useGraphics && m.imageTab == 2
+
+	if useFullscreen {
+		// Graphics protocols: use most of the screen height, leave room for header/footer
+		width = m.width - 8
+		height = m.height - 8 // Leave room for title bar and help text
+		if width < 40 {
+			width = 40
+		}
+		if height < 20 {
+			height = 20
+		}
+	} else {
+		// Half-block: fit within viewport
+		width = m.viewport.Width - 4
+		if width < 20 {
+			width = 20
+		}
+		if width > 100 {
+			width = 100
+		}
+		height = m.viewport.Height - 4
+		if height < 10 {
+			height = 10
+		}
+		if height > 50 {
+			height = 50
+		}
+	}
+
+	useGraphics := m.useGraphics && m.imageTab == 2
+	downloader := m.downloader
+
 	return func() tea.Msg {
-		width := 60
-		height := 30
-		img, err := images.ImageToHalfBlock(path, width, height)
+		var img string
+		var err error
+		if useGraphics {
+			// Use the detected graphics protocol
+			img, err = downloader.RenderImage(path, width, height)
+		} else {
+			// Use safe half-block rendering for viewport
+			img, err = downloader.RenderImageSafe(path, width, height)
+		}
 		return imageLoadedMsg{image: img, err: err}
 	}
 }
@@ -464,9 +704,19 @@ func (m Model) View() string {
 func (m Model) renderList() string {
 	var b strings.Builder
 
-	// Title
-	title := TitleStyle.Render("Recipe Tracker")
-	b.WriteString(title + "\n\n")
+	// Title with connection indicator
+	if m.isRemote {
+		title := TitleStyle.Render("Recipe Tracker") + "  " + SuccessStyle.Render("● connected")
+		b.WriteString(title + "\n")
+		b.WriteString(MetaStyle.Render("  "+m.serverURL) + "\n\n")
+	} else if m.remoteClient != nil {
+		title := TitleStyle.Render("Recipe Tracker") + "  " + SuccessStyle.Render("● syncing")
+		b.WriteString(title + "\n")
+		b.WriteString(MetaStyle.Render("  local + sync") + "\n\n")
+	} else {
+		title := TitleStyle.Render("Recipe Tracker")
+		b.WriteString(title + "\n\n")
+	}
 
 	// Recipe count and search info
 	if m.isSearching || len(m.recipes) != len(m.allRecipes) {
@@ -563,6 +813,12 @@ func (m Model) renderRecipe() string {
 		return BaseStyle.Render("No recipe selected")
 	}
 
+	// Special handling for photo tab with graphics protocols
+	// Render image directly without viewport to avoid overlap
+	if m.imageTab == 2 && m.useGraphics {
+		return m.renderPhotoFullscreen()
+	}
+
 	var b strings.Builder
 
 	// Title
@@ -600,7 +856,7 @@ func (m Model) renderRecipe() string {
 	b.WriteString(m.viewport.View() + "\n")
 
 	// Help
-	help := HelpStyle.Render("tab: switch tabs | j/k: scroll | esc: back to list")
+	help := HelpStyle.Render("tab: switch tabs | j/k: scroll | esc: back")
 	b.WriteString(help)
 
 	return BaseStyle.Render(b.String())
@@ -669,7 +925,7 @@ func (m Model) renderInstructions() string {
 	return b.String()
 }
 
-// renderImage renders the recipe image
+// renderImage renders the recipe image (for half-block in viewport)
 func (m Model) renderImage() string {
 	var b strings.Builder
 
@@ -685,6 +941,42 @@ func (m Model) renderImage() string {
 	}
 
 	return b.String()
+}
+
+// renderPhotoFullscreen renders the photo tab for graphics protocols
+// This renders directly without a viewport to prevent text overlap
+func (m Model) renderPhotoFullscreen() string {
+	var b strings.Builder
+
+	// Minimal header - just recipe title
+	title := RecipeTitleStyle.Render(Truncate(m.currentRecipe.Title, m.width-10))
+	b.WriteString(title + "\n")
+
+	// Tabs on same line to save space
+	tabs := []string{"[i]ngredients", "[s]teps", "[p]hoto"}
+	var tabLine strings.Builder
+	for i, tab := range tabs {
+		if i == m.imageTab {
+			tabLine.WriteString(ActiveTabStyle.Render(tab))
+		} else {
+			tabLine.WriteString(InactiveTabStyle.Render(tab))
+		}
+	}
+	b.WriteString(tabLine.String() + "\n\n")
+
+	// Render image directly (no viewport wrapper)
+	if m.recipeImage != "" {
+		b.WriteString(m.recipeImage)
+	} else if len(m.currentRecipe.ImagePaths) > 0 {
+		b.WriteString(MetaStyle.Render("Loading image...") + "\n")
+	} else {
+		b.WriteString(MetaStyle.Render("No image available") + "\n")
+	}
+
+	// Help at bottom
+	b.WriteString("\n" + HelpStyle.Render("tab: switch tabs | esc: back"))
+
+	return BaseStyle.Render(b.String())
 }
 
 // renderLoading renders the loading screen
