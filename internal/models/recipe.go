@@ -23,6 +23,7 @@ type Recipe struct {
 	PrepTime     string       `json:"prep_time"`
 	CookTime     string       `json:"cook_time"`
 	Servings     string       `json:"servings"`
+	Notes        string       `json:"notes"`
 	CreatedAt    time.Time    `json:"created_at"`
 	UpdatedAt    time.Time    `json:"updated_at"`
 }

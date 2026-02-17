@@ -844,11 +844,17 @@ const webAppHTML = `<!DOCTYPE html>
             <div class="tabs">
                 <div class="tab active" data-tab="ingredients" onclick="switchTab('ingredients')">ingredients</div>
                 <div class="tab" data-tab="instructions" onclick="switchTab('instructions')">instructions</div>
+                <div class="tab" data-tab="notes" onclick="switchTab('notes')">notes</div>
             </div>
 
             <div class="tab-content">
                 <div class="tab-panel active" id="ingredientsPanel"></div>
                 <div class="tab-panel" id="instructionsPanel"></div>
+                <div class="tab-panel" id="notesPanel">
+                    <div class="section-header">notes</div>
+                    <textarea id="notesArea" style="width: 100%; min-height: 200px; background: var(--ctp-surface0); color: var(--ctp-text); border: 1px solid var(--ctp-surface1); border-radius: 4px; padding: 12px; font-family: inherit; font-size: 14px; outline: none; margin-bottom: 12px; resize: vertical;" placeholder="Add notes here..."></textarea>
+                    <button class="btn btn-primary" style="width: 100%;" onclick="saveNotes()">$ save-notes</button>
+                </div>
             </div>
         </div>
 
@@ -986,6 +992,7 @@ const webAppHTML = `<!DOCTYPE html>
                 </div>
             ` + "`" + `).join('') || '<p style="color: var(--ctp-overlay0)">No instructions listed</p>');
             document.getElementById('instructionsPanel').innerHTML = instructionsHtml;
+            document.getElementById('notesArea').value = currentRecipe.notes || '';
 
             // Show detail view
             document.querySelector('.list-view').style.display = 'none';
@@ -1076,6 +1083,35 @@ const webAppHTML = `<!DOCTYPE html>
             } finally {
                 btn.textContent = '$ fetch --save';
                 btn.disabled = false;
+            }
+        }
+
+        // Save notes
+        async function saveNotes() {
+            if (!currentRecipe) return;
+            const notes = document.getElementById('notesArea').value;
+            
+            try {
+                const updatedRecipe = { ...currentRecipe, notes };
+                const response = await fetch(API_BASE + '/api/recipes/' + currentRecipe.id, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(updatedRecipe)
+                });
+
+                if (response.ok) {
+                    currentRecipe.notes = notes;
+                    // Update in main list too
+                    const index = recipes.findIndex(r => r.id === currentRecipe.id);
+                    if (index >= 0) recipes[index].notes = notes;
+                    
+                    showSyncStatus('success', 'notes saved');
+                } else {
+                    throw new Error(await response.text());
+                }
+            } catch (error) {
+                console.error('Failed to save notes:', error);
+                showSyncStatus('error', 'save failed');
             }
         }
 

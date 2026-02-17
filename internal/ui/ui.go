@@ -3,8 +3,10 @@ package ui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -36,6 +38,7 @@ const (
 	ViewRecipe
 	ViewLoading
 	ViewSearch
+	ViewEditNotes
 )
 
 // Model represents the application state
@@ -78,7 +81,7 @@ type Model struct {
 	viewport      viewport.Model
 	recipeImage   string
 	showImage     bool
-	imageTab      int  // 0: ingredients, 1: instructions, 2: image
+	imageTab      int  // 0: ingredients, 1: instructions, 2: image, 3: notes
 	useGraphics   bool // true if using Kitty/iTerm2/Sixel (non-text graphics)
 
 	// Loading state
@@ -90,6 +93,9 @@ type Model struct {
 	searchResults []models.Recipe
 	allRecipes    []models.Recipe
 	isSearching   bool
+
+	// Notes state
+	notesInput textarea.Model
 }
 
 // Messages
@@ -150,6 +156,12 @@ func newModelInternal(store models.RecipeRepository, fetcher RecipeFetcher, remo
 	sp.Spinner = spinner.Dot
 	sp.Style = SpinnerStyle
 
+	// Notes input
+	ta := textarea.New()
+	ta.Placeholder = "Enter notes here..."
+	ta.Focus()
+	ta.CharLimit = 2000
+
 	// Viewport
 	vp := viewport.New(80, 20)
 
@@ -176,6 +188,7 @@ func newModelInternal(store models.RecipeRepository, fetcher RecipeFetcher, remo
 		allRecipes:  allRecipes,
 		urlInput:    ti,
 		searchInput: si,
+		notesInput:  ta,
 		spinner:     sp,
 		viewport:    vp,
 		useGraphics: useGraphics,
@@ -213,6 +226,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.viewport.Width = msg.Width - 4
 		m.viewport.Height = msg.Height - 10
+		m.notesInput.SetWidth(msg.Width - 4)
+		m.notesInput.SetHeight(msg.Height - 10)
 		m.ready = true
 
 		// Reload image if we're viewing a recipe with an image
@@ -337,6 +352,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.viewport, cmd = m.viewport.Update(msg)
 		cmds = append(cmds, cmd)
+
+	case ViewEditNotes:
+		var cmd tea.Cmd
+		m.notesInput, cmd = m.notesInput.Update(msg)
+		cmds = append(cmds, cmd)
 	}
 
 	return m, tea.Batch(cmds...)
@@ -387,6 +407,8 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleRecipeKeys(msg)
 	case ViewSearch:
 		return m.handleSearchKeys(msg)
+	case ViewEditNotes:
+		return m.handleEditNotesKeys(msg)
 	}
 
 	return m, nil
@@ -505,7 +527,7 @@ func (m Model) handleRecipeKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "tab":
 		oldTab := m.imageTab
-		m.imageTab = (m.imageTab + 1) % 3
+		m.imageTab = (m.imageTab + 1) % 4
 		m.viewport.SetContent(m.renderRecipeContent())
 		m.viewport.GotoTop()
 		// Clear graphics and reload if switching to/from photo tab with graphics mode
@@ -521,7 +543,7 @@ func (m Model) handleRecipeKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "shift+tab":
 		oldTab := m.imageTab
-		m.imageTab = (m.imageTab + 2) % 3
+		m.imageTab = (m.imageTab + 3) % 4
 		m.viewport.SetContent(m.renderRecipeContent())
 		m.viewport.GotoTop()
 		if m.useGraphics && oldTab == 2 {
@@ -562,6 +584,24 @@ func (m Model) handleRecipeKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.recipeImage = ""
 			return m, m.loadImage(m.currentRecipe.ImagePaths[0])
 		}
+
+	case "n":
+		wasOnPhoto := m.imageTab == 2
+		m.imageTab = 3
+		m.viewport.SetContent(m.renderRecipeContent())
+		m.viewport.GotoTop()
+		if wasOnPhoto && m.useGraphics {
+			m.recipeImage = ""
+			return m, tea.ClearScreen
+		}
+
+	case "e":
+		if m.imageTab == 3 && m.currentRecipe != nil {
+			m.view = ViewEditNotes
+			m.notesInput.SetValue(m.currentRecipe.Notes)
+			m.notesInput.Focus()
+			return m, nil
+		}
 	}
 
 	// Viewport navigation
@@ -597,6 +637,45 @@ func (m Model) handleSearchKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Update text input
 	var cmd tea.Cmd
 	m.searchInput, cmd = m.searchInput.Update(msg)
+	return m, cmd
+}
+
+// handleEditNotesKeys handles keys in edit notes view
+func (m Model) handleEditNotesKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+s":
+		if m.currentRecipe != nil {
+			m.currentRecipe.Notes = m.notesInput.Value()
+			m.currentRecipe.UpdatedAt = time.Now()
+
+			// Save to store
+			if err := m.store.AddRecipe(*m.currentRecipe); err != nil {
+				// Handle error? For now just go back
+			}
+
+			// Notify remote client for sync
+			if m.remoteClient != nil {
+				go func(r models.Recipe) {
+					_ = m.remoteClient.AddRecipe(r)
+				}(*m.currentRecipe)
+			}
+
+			// Notify API server if in server mode
+			if m.apiServer != nil {
+				m.apiServer.NotifyChange("update", m.currentRecipe, m.currentRecipe.ID)
+			}
+		}
+		m.view = ViewRecipe
+		m.viewport.SetContent(m.renderRecipeContent())
+		return m, nil
+
+	case "esc":
+		m.view = ViewRecipe
+		return m, nil
+	}
+
+	var cmd tea.Cmd
+	m.notesInput, cmd = m.notesInput.Update(msg)
 	return m, cmd
 }
 
@@ -695,9 +774,26 @@ func (m Model) View() string {
 		return m.renderLoading()
 	case ViewSearch:
 		return m.renderSearch()
+	case ViewEditNotes:
+		return m.renderEditNotes()
 	default:
 		return "Unknown view"
 	}
+}
+
+// renderEditNotes renders the edit notes view
+func (m Model) renderEditNotes() string {
+	var b strings.Builder
+
+	title := TitleStyle.Render("Edit Notes")
+	b.WriteString(title + "\n\n")
+
+	b.WriteString(m.notesInput.View() + "\n\n")
+
+	help := HelpStyle.Render("ctrl+s: save | esc: cancel")
+	b.WriteString(help)
+
+	return BaseStyle.Render(b.String())
 }
 
 // renderList renders the recipe list view
@@ -841,7 +937,7 @@ func (m Model) renderRecipe() string {
 	}
 
 	// Tabs
-	tabs := []string{"[i]ngredients", "[s]teps", "[p]hoto"}
+	tabs := []string{"[i]ngredients", "[s]teps", "[p]hoto", "[n]otes"}
 	var tabLine strings.Builder
 	for i, tab := range tabs {
 		if i == m.imageTab {
@@ -856,7 +952,11 @@ func (m Model) renderRecipe() string {
 	b.WriteString(m.viewport.View() + "\n")
 
 	// Help
-	help := HelpStyle.Render("tab: switch tabs | j/k: scroll | esc: back")
+	helpText := "tab: switch tabs | j/k: scroll | esc: back"
+	if m.imageTab == 3 {
+		helpText = "e: edit notes | " + helpText
+	}
+	help := HelpStyle.Render(helpText)
 	b.WriteString(help)
 
 	return BaseStyle.Render(b.String())
@@ -875,6 +975,8 @@ func (m Model) renderRecipeContent() string {
 		return m.renderInstructions()
 	case 2: // Image
 		return m.renderImage()
+	case 3: // Notes
+		return m.renderNotes()
 	default:
 		return ""
 	}
@@ -925,6 +1027,24 @@ func (m Model) renderInstructions() string {
 	return b.String()
 }
 
+// renderNotes renders the recipe notes
+func (m Model) renderNotes() string {
+	var b strings.Builder
+
+	b.WriteString(SectionTitleStyle.Render("Notes") + "\n\n")
+
+	if m.currentRecipe.Notes == "" {
+		b.WriteString(MetaStyle.Render("No notes yet.") + "\n")
+		return b.String()
+	}
+
+	// Word wrap notes
+	wrapped := wordWrap(m.currentRecipe.Notes, m.viewport.Width-4)
+	b.WriteString(InstructionStyle.Render(wrapped) + "\n")
+
+	return b.String()
+}
+
 // renderImage renders the recipe image (for half-block in viewport)
 func (m Model) renderImage() string {
 	var b strings.Builder
@@ -953,7 +1073,7 @@ func (m Model) renderPhotoFullscreen() string {
 	b.WriteString(title + "\n")
 
 	// Tabs on same line to save space
-	tabs := []string{"[i]ngredients", "[s]teps", "[p]hoto"}
+	tabs := []string{"[i]ngredients", "[s]teps", "[p]hoto", "[n]otes"}
 	var tabLine strings.Builder
 	for i, tab := range tabs {
 		if i == m.imageTab {
