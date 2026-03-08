@@ -116,6 +116,17 @@ func (s *Server) handleRecipe(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/recipes/")
 	id := strings.TrimSuffix(path, "/")
 
+	// Check for /refresh suffix
+	if strings.HasSuffix(id, "/refresh") {
+		id = strings.TrimSuffix(id, "/refresh")
+		if r.Method == http.MethodPost {
+			s.refreshRecipe(w, r, id)
+			return
+		}
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	if id == "" {
 		http.Error(w, "Recipe ID required", http.StatusBadRequest)
 		return
@@ -230,6 +241,55 @@ func (s *Server) deleteRecipe(w http.ResponseWriter, r *http.Request, id string)
 	})
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// refreshRecipe re-fetches recipe data from the source URL while preserving user data
+func (s *Server) refreshRecipe(w http.ResponseWriter, r *http.Request, id string) {
+	// Get existing recipe
+	existing, err := s.store.GetRecipe(id)
+	if err != nil {
+		http.Error(w, "Recipe not found", http.StatusNotFound)
+		return
+	}
+
+	// Check if recipe has a URL to refresh from
+	if existing.URL == "" {
+		http.Error(w, "Recipe has no source URL to refresh from", http.StatusBadRequest)
+		return
+	}
+
+	// Fetch fresh data from the URL
+	refreshed, err := s.parser.FetchAndParse(existing.URL)
+	if err != nil {
+		http.Error(w, "Failed to refresh recipe: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Preserve user data from existing recipe
+	refreshed.ID = existing.ID
+	refreshed.Notes = existing.Notes
+	refreshed.CreatedAt = existing.CreatedAt
+	refreshed.UpdatedAt = time.Now()
+
+	// Preserve local image paths if they exist and no new images were found
+	if len(refreshed.ImagePaths) == 0 && len(existing.ImagePaths) > 0 {
+		refreshed.ImagePaths = existing.ImagePaths
+	}
+
+	// Save the refreshed recipe
+	if err := s.store.AddRecipe(*refreshed); err != nil {
+		http.Error(w, "Failed to save refreshed recipe: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Notify connected clients
+	s.broadcast(SyncEvent{
+		Type:      "update",
+		Recipe:    refreshed,
+		Timestamp: refreshed.UpdatedAt,
+	})
+
+	s.jsonResponse(w, http.StatusOK, refreshed)
 }
 
 // handleParse parses a recipe URL

@@ -24,7 +24,7 @@ import (
 func main() {
 	// Command line flags
 	serverMode := flag.Bool("server", false, "Run as server (hosts webapp and API)")
-	connectTo := flag.String("connect", "https://cook.jackx.dev", "Connect to a remote server (e.g., http://192.168.1.100:8080)")
+	connectTo := flag.String("connect", "https://cookbook.jackx.dev", "Connect to a remote server (e.g., http://192.168.1.100:8080)")
 	webPort := flag.String("port", "8080", "Port for server mode")
 	syncTo := flag.String("sync", "", "Sync local changes to remote server (for local mode)")
 

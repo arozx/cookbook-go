@@ -15,7 +15,7 @@ import (
 
 func main() {
 	// Command line flags
-	serverURL := flag.String("server", "https://cook.jackx.dev", "Server URL to connect to (default: https://cook.jackx.dev)")
+	serverURL := flag.String("server", "https://cookbook.jackx.dev", "Server URL to connect to (default: https://cookbook.jackx.dev)")
 	cacheDir := flag.String("cache", "", "Cache directory for images (default: ~/.recipe-tracker/images)")
 	flag.Parse()
 

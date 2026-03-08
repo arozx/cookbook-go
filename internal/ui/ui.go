@@ -104,6 +104,11 @@ type recipeLoadedMsg struct {
 	err    error
 }
 
+type recipeRefreshedMsg struct {
+	recipe *models.Recipe
+	err    error
+}
+
 type imageLoadedMsg struct {
 	image string
 	err   error
@@ -284,6 +289,50 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case imageLoadedMsg:
 		if msg.err == nil {
 			m.recipeImage = msg.image
+		}
+		return m, nil
+
+	case recipeRefreshedMsg:
+		if msg.err != nil {
+			m.addError = fmt.Sprintf("Error refreshing: %v", msg.err)
+			m.view = ViewRecipe
+			return m, nil
+		}
+
+		// Download images if we have new ones
+		if m.downloader != nil && len(msg.recipe.ImageURLs) > 0 {
+			msg.recipe.ImagePaths = m.downloader.DownloadAll(msg.recipe.ImageURLs)
+		}
+
+		// Save the refreshed recipe
+		if err := m.store.AddRecipe(*msg.recipe); err != nil {
+			m.addError = fmt.Sprintf("Error saving refreshed recipe: %v", err)
+			m.view = ViewRecipe
+			return m, nil
+		}
+
+		// Notify remote client for sync
+		if m.remoteClient != nil {
+			go func() {
+				_ = m.remoteClient.AddRecipe(*msg.recipe)
+			}()
+		}
+
+		// Notify API server if in server mode
+		if m.apiServer != nil {
+			m.apiServer.NotifyChange("update", msg.recipe, msg.recipe.ID)
+		}
+
+		m.recipes = m.store.GetAllRecipes()
+		m.allRecipes = m.recipes
+		m.currentRecipe = msg.recipe
+		m.addSuccess = "Recipe refreshed successfully!"
+		m.view = ViewRecipe
+		m.viewport.SetContent(m.renderRecipeContent())
+
+		// Load image for display
+		if m.downloader != nil && len(msg.recipe.ImagePaths) > 0 {
+			return m, m.loadImage(msg.recipe.ImagePaths[0])
 		}
 		return m, nil
 
@@ -602,6 +651,14 @@ func (m Model) handleRecipeKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.notesInput.Focus()
 			return m, nil
 		}
+
+	case "r":
+		// Refresh recipe from source URL
+		if m.currentRecipe != nil && m.currentRecipe.URL != "" {
+			m.loadingMsg = "Refreshing recipe..."
+			m.view = ViewLoading
+			return m, m.refreshRecipe(m.currentRecipe)
+		}
 	}
 
 	// Viewport navigation
@@ -698,6 +755,50 @@ func (m Model) fetchRecipe(url string) tea.Cmd {
 
 	return func() tea.Msg {
 		return recipeLoadedMsg{recipe: nil, err: fmt.Errorf("no recipe fetcher available")}
+	}
+}
+
+// refreshRecipe re-fetches recipe data from URL while preserving user data
+func (m Model) refreshRecipe(existing *models.Recipe) tea.Cmd {
+	// Capture values needed in the closure
+	url := existing.URL
+	id := existing.ID
+	notes := existing.Notes
+	createdAt := existing.CreatedAt
+
+	// Use remote fetcher if connected to server, otherwise local
+	if m.isRemote && m.remoteFetch != nil {
+		return func() tea.Msg {
+			recipe, err := m.remoteFetch.ParseRecipeURL(url)
+			if err != nil {
+				return recipeRefreshedMsg{recipe: nil, err: err}
+			}
+			// Preserve user data
+			recipe.ID = id
+			recipe.Notes = notes
+			recipe.CreatedAt = createdAt
+			recipe.UpdatedAt = time.Now()
+			return recipeRefreshedMsg{recipe: recipe, err: nil}
+		}
+	}
+
+	if m.fetcher != nil {
+		return func() tea.Msg {
+			recipe, err := m.fetcher.FetchAndParse(url)
+			if err != nil {
+				return recipeRefreshedMsg{recipe: nil, err: err}
+			}
+			// Preserve user data
+			recipe.ID = id
+			recipe.Notes = notes
+			recipe.CreatedAt = createdAt
+			recipe.UpdatedAt = time.Now()
+			return recipeRefreshedMsg{recipe: recipe, err: nil}
+		}
+	}
+
+	return func() tea.Msg {
+		return recipeRefreshedMsg{recipe: nil, err: fmt.Errorf("no recipe fetcher available")}
 	}
 }
 
@@ -952,7 +1053,7 @@ func (m Model) renderRecipe() string {
 	b.WriteString(m.viewport.View() + "\n")
 
 	// Help
-	helpText := "tab: switch tabs | j/k: scroll | esc: back"
+	helpText := "tab: switch tabs | j/k: scroll | r: refresh | esc: back"
 	if m.imageTab == 3 {
 		helpText = "e: edit notes | " + helpText
 	}
@@ -1094,7 +1195,7 @@ func (m Model) renderPhotoFullscreen() string {
 	}
 
 	// Help at bottom
-	b.WriteString("\n" + HelpStyle.Render("tab: switch tabs | esc: back"))
+	b.WriteString("\n" + HelpStyle.Render("tab: switch tabs | r: refresh | esc: back"))
 
 	return BaseStyle.Render(b.String())
 }
